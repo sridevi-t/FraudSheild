@@ -1,0 +1,761 @@
+!pip install scikit-learn pandas numpy matplotlib seaborn imbalanced-learn groq flask flask-cors pyngrok -q
+print("✅ All libraries installed")
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+np.random.seed(42)
+N = 5000
+
+def generate_data(n):
+    df = pd.DataFrame({
+        'amount':          np.random.exponential(120, n),
+        'hour':            np.random.randint(0, 24, n),
+        'day_of_week':     np.random.randint(0, 7, n),
+        'merchant_risk':   np.random.beta(2, 8, n),
+        'geo_distance_km': np.random.exponential(50, n),
+        'txn_per_hour':    np.random.poisson(2, n),
+        'card_age_days':   np.random.randint(1, 3650, n),
+        'is_online':       np.random.binomial(1, 0.4, n),
+    })
+    fraud_mask = np.random.random(n) < 0.05
+    df.loc[fraud_mask, 'amount']          *= np.random.uniform(3, 10, fraud_mask.sum())
+    df.loc[fraud_mask, 'merchant_risk']   += 0.5
+    df.loc[fraud_mask, 'geo_distance_km'] *= np.random.uniform(5, 20, fraud_mask.sum())
+    df.loc[fraud_mask, 'txn_per_hour']    += np.random.randint(5, 15, fraud_mask.sum())
+    df['is_fraud'] = fraud_mask.astype(int)
+    return df
+
+df = generate_data(N)
+print(f"✅ Dataset ready: {len(df)} rows | Fraud rate: {df['is_fraud'].mean()*100:.1f}%")
+df.head()
+
+def add_features(df):
+    df = df.copy()
+    df['amount_log']    = np.log1p(df['amount'])
+    df['is_night']      = ((df['hour'] < 6) | (df['hour'] > 22)).astype(int)
+    df['is_weekend']    = (df['day_of_week'] >= 5).astype(int)
+    df['high_velocity'] = (df['txn_per_hour'] > 5).astype(int)
+    df['new_card']      = (df['card_age_days'] < 30).astype(int)
+    df['amount_zscore'] = df.groupby('hour')['amount'].transform(
+        lambda x: (x - x.mean()) / (x.std() + 1e-8)
+    )
+    return df
+
+df = add_features(df)
+
+FEATURES = ['amount_log','amount_zscore','hour','is_night','is_weekend',
+            'merchant_risk','geo_distance_km','txn_per_hour','high_velocity',
+            'card_age_days','new_card','is_online']
+
+print("✅ Features ready:", FEATURES)
+
+from sklearn.ensemble import RandomForestClassifier, IsolationForest
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix
+from imblearn.over_sampling import SMOTE
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+X = df[FEATURES]
+y = df['is_fraud']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+sm = SMOTE(random_state=42)
+X_res, y_res = sm.fit_resample(X_train, y_train)
+
+scaler = StandardScaler()
+X_res_s  = scaler.fit_transform(X_res)
+X_test_s = scaler.transform(X_test)
+
+rf = RandomForestClassifier(n_estimators=200, max_depth=12,
+                            class_weight='balanced', random_state=42)
+rf.fit(X_res_s, y_res)
+rf_proba = rf.predict_proba(X_test_s)[:, 1]
+
+iso = IsolationForest(contamination=0.05, random_state=42)
+iso.fit(X_res_s)
+iso_scores      = -iso.score_samples(X_test_s)
+iso_scores_norm = (iso_scores - iso_scores.min()) / (iso_scores.max() - iso_scores.min())
+
+final_score = 0.7 * rf_proba + 0.3 * iso_scores_norm
+final_pred  = (final_score > 0.5).astype(int)
+
+print("=== Ensemble Model ===")
+print(classification_report(y_test, final_pred))
+print(f"ROC-AUC: {roc_auc_score(y_test, final_score):.4f}")
+
+cm = confusion_matrix(y_test, final_pred)
+plt.figure(figsize=(6,4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Oranges',
+            xticklabels=['Legit','Fraud'], yticklabels=['Legit','Fraud'])
+plt.title('Confusion Matrix')
+plt.tight_layout(); plt.show()
+print("✅ Model trained successfully")
+
+from sklearn.metrics import roc_curve
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+importances = pd.Series(rf.feature_importances_, index=FEATURES).sort_values(ascending=True)
+importances.plot(kind='barh', ax=axes[0], color='#FF6B00')
+axes[0].set_title('Feature Importances')
+axes[0].set_xlabel('Importance')
+
+fpr, tpr, _ = roc_curve(y_test, final_score)
+axes[1].plot(fpr, tpr, color='#000080', lw=2,
+             label=f'AUC = {roc_auc_score(y_test, final_score):.3f}')
+axes[1].plot([0,1],[0,1],'k--',lw=1)
+axes[1].set(xlabel='False Positive Rate', ylabel='True Positive Rate', title='ROC Curve')
+axes[1].legend()
+plt.tight_layout(); plt.show()
+print("✅ Charts displayed")
+
+# ================================================================
+#  CELL 6 — FRAUDSHIELD WEB APP (FULLY SELF-CONTAINED)
+#  1. Replace GROQ_API_KEY  → your key from console.groq.com
+#  2. Replace NGROK_TOKEN   → your token from dashboard.ngrok.com
+#  3. Run Cells 1–5 first, then run this cell
+#  4. Copy the printed URL and open it in your browser
+# ================================================================
+
+import os, json, time, threading
+import numpy as np, pandas as pd
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from groq import Groq
+from pyngrok import ngrok
+
+# ── PASTE YOUR KEYS HERE ─────────────────────────────────────────
+GROQ_API_KEY = "gsk_YOUR_GROQ_API_KEY_HERE"   # from console.groq.com
+NGROK_TOKEN  = "YOUR_NGROK_AUTH_TOKEN_HERE"   # from dashboard.ngrok.com
+PORT         = 5050
+# ─────────────────────────────────────────────────────────────────
+
+groq_client     = Groq(api_key=GROQ_API_KEY)
+transaction_log = []
+
+# ── Helper functions ──────────────────────────────────────────────
+def engineer_features(raw):
+    df = pd.DataFrame([raw])
+    df['amount_log']    = np.log1p(df['amount'])
+    df['is_night']      = ((df['hour'] < 6) | (df['hour'] > 22)).astype(int)
+    df['is_weekend']    = (df['day_of_week'] >= 5).astype(int)
+    df['high_velocity'] = (df['txn_per_hour'] > 5).astype(int)
+    df['new_card']      = (df['card_age_days'] < 30).astype(int)
+    df['amount_zscore'] = (df['amount_log'] - 5.0) / 2.0
+    return df[FEATURES]
+
+def get_top_features(txn_s, n=4):
+    scores = rf.feature_importances_ * np.abs(txn_s[0])
+    idx    = scores.argsort()[::-1][:n]
+    return {FEATURES[i]: round(float(scores[i]), 4) for i in idx}
+
+def explain(txn_raw, score, top_feat):
+    decision = "BLOCKED" if score > 0.7 else ("REVIEW" if score > 0.4 else "APPROVED")
+    prompt = f"""You are a concise fraud analyst AI for an Indian payment platform.
+Transaction: {json.dumps({k: round(v,2) if isinstance(v,float) else v for k,v in txn_raw.items()})}
+Fraud score: {score:.3f} -> Decision: {decision}
+Top risk features: {json.dumps(top_feat)}
+Reply in exactly 3 bullet points using * character:
+* Decision summary (mention the INR amount)
+* Top 2 risk signals in plain English
+* Recommended action for the analyst
+Max 90 words."""
+    try:
+        r = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=220, temperature=0.25,
+        )
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        return f"* AI explanation unavailable.\n* Error: {str(e)}\n* Check Groq API key."
+
+# ── HTML Dashboard (fully embedded) ──────────────────────────────
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SurakshaPay — AI Fraud Detection</title>
+<link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --saffron:#FF6B00; --saffron2:#FF9933; --green:#138808; --navy2:#1a1a6e;
+    --white:#FFFFFF; --cream:#FFF8F0; --red:#D32F2F; --amber:#F57C00;
+    --bg:#F5F0E8; --card:#FFFFFF; --border:#E8DDD0; --text:#1A1A2E;
+    --muted:#7A6E62; --blue:#0066CC;
+  }
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+  .tricolor{height:6px;background:linear-gradient(90deg,var(--saffron2) 33.33%,var(--white) 33.33% 66.66%,var(--green) 66.66%)}
+  header{background:var(--navy2);padding:0 32px;box-shadow:0 4px 20px rgba(0,0,128,.3)}
+  .header-inner{max-width:1200px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;padding:14px 0}
+  .logo-area{display:flex;align-items:center;gap:14px}
+  .logo-icon{width:46px;height:46px;background:var(--saffron2);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:22px;animation:spin 20s linear infinite;flex-shrink:0}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .logo-main{font-family:'Baloo 2',cursive;font-size:22px;font-weight:800;color:#fff;line-height:1}
+  .logo-main span{color:var(--saffron2)}
+  .logo-sub{font-size:11px;color:rgba(255,255,255,.5);margin-top:2px}
+  .header-right{display:flex;align-items:center;gap:20px}
+  .live-pill{display:flex;align-items:center;gap:6px;background:rgba(19,136,8,.2);border:1px solid rgba(19,136,8,.5);padding:5px 14px;border-radius:100px;font-size:11px;font-weight:600;color:#4CAF50;letter-spacing:1px;text-transform:uppercase}
+  .live-dot{width:7px;height:7px;border-radius:50%;background:#4CAF50;animation:blink 1.2s ease-in-out infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+  .hdr-info{font-size:11px;color:rgba(255,255,255,.5);text-align:right;line-height:1.6}
+  .hdr-info strong{color:rgba(255,255,255,.85)}
+  .stats-bar{background:var(--saffron);padding:0 32px}
+  .stats-inner{max-width:1200px;margin:0 auto;display:grid;grid-template-columns:repeat(4,1fr)}
+  .stat-item{padding:13px 20px;border-right:1px solid rgba(255,255,255,.2);display:flex;align-items:center;gap:12px}
+  .stat-item:last-child{border-right:none}
+  .stat-num{font-family:'Baloo 2',cursive;font-size:22px;font-weight:800;color:#fff;line-height:1}
+  .stat-lbl{font-size:10px;color:rgba(255,255,255,.75);font-weight:500;letter-spacing:.5px;text-transform:uppercase;margin-top:2px}
+  .main{max-width:1200px;margin:28px auto;padding:0 32px;display:grid;grid-template-columns:400px 1fr;gap:24px}
+  .card{background:#fff;border:1px solid var(--border);border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,128,.06);margin-bottom:20px}
+  .card:last-child{margin-bottom:0}
+  .card-head{padding:15px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;background:linear-gradient(135deg,#FFF8F0,#fff)}
+  .card-icon{width:34px;height:34px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+  .card-icon.saffron{background:var(--saffron2)}.card-icon.green{background:var(--green)}.card-icon.navy{background:var(--navy2)}.card-icon.blue{background:var(--blue)}
+  .card-title{font-family:'Baloo 2',cursive;font-size:15px;font-weight:700;color:var(--text)}
+  .card-sub{font-size:11px;color:var(--muted);margin-top:1px}
+  .card-body{padding:20px}
+  .section-label{font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--saffron);margin-bottom:12px;display:flex;align-items:center;gap:6px}
+  .section-label::after{content:'';flex:1;height:1px;background:var(--border)}
+  .field{margin-bottom:12px}
+  .field label{display:block;font-size:11px;font-weight:600;color:var(--muted);margin-bottom:5px}
+  .field input,.field select{width:100%;padding:9px 13px;border:1.5px solid var(--border);border-radius:8px;font-family:'DM Sans',sans-serif;font-size:13px;color:var(--text);background:var(--cream);outline:none;transition:border-color .2s,box-shadow .2s}
+  .field input:focus,.field select:focus{border-color:var(--saffron2);box-shadow:0 0 0 3px rgba(255,153,51,.12);background:#fff}
+  .field-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+  .rupee-wrap{position:relative}.rs{position:absolute;left:13px;top:50%;transform:translateY(-50%);font-size:14px;font-weight:700;color:var(--saffron)}
+  .rupee-wrap input{padding-left:28px}
+  .preset-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:16px}
+  .preset{padding:8px;border-radius:8px;border:1.5px solid var(--border);font-family:'DM Sans',sans-serif;font-size:12px;font-weight:600;cursor:pointer;background:var(--cream);color:var(--text);transition:all .15s;text-align:center}
+  .preset:hover{transform:translateY(-1px);box-shadow:0 3px 8px rgba(0,0,0,.1)}
+  .p1{border-color:#2196F3;color:#2196F3}.p1:hover{background:#E3F2FD}
+  .p2{border-color:#9C27B0;color:#9C27B0}.p2:hover{background:#F3E5F5}
+  .p3{border-color:var(--amber);color:var(--amber)}.p3:hover{background:#FFF3E0}
+  .p4{border-color:var(--red);color:var(--red)}.p4:hover{background:#FFEBEE}
+  .btn-analyze{width:100%;padding:14px;background:linear-gradient(135deg,var(--saffron),var(--saffron2));color:#fff;border:none;border-radius:10px;font-family:'Baloo 2',cursive;font-size:16px;font-weight:700;cursor:pointer;transition:all .2s;box-shadow:0 4px 14px rgba(255,107,0,.35);margin-bottom:8px}
+  .btn-analyze:hover{transform:translateY(-1px);box-shadow:0 6px 18px rgba(255,107,0,.4)}
+  .btn-analyze:disabled{opacity:.6;cursor:not-allowed;transform:none}
+  .btn-analyze.loading{animation:pulse .8s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+  .btn-auto{width:100%;padding:10px;background:transparent;color:var(--navy2);border:1.5px dashed var(--navy2);border-radius:10px;font-family:'DM Sans',sans-serif;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s}
+  .btn-auto:hover{background:rgba(0,0,128,.05)}
+  .btn-auto.running{border-color:var(--red);color:var(--red);border-style:solid;background:rgba(211,47,47,.04)}
+  .right-col{display:flex;flex-direction:column;gap:0}
+  .result-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:52px 24px;gap:12px;text-align:center}
+  .placeholder-icon{font-size:56px;opacity:.12;animation:float 3s ease-in-out infinite}
+  @keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
+  .result-body{padding:20px;display:flex;flex-direction:column;gap:16px}
+  .verdict-row{display:flex;align-items:center;justify-content:space-between}
+  .verdict-left{display:flex;align-items:center;gap:14px}
+  .verdict-emoji{font-size:38px}
+  .verdict-text{font-family:'Baloo 2',cursive;font-size:26px;font-weight:800;line-height:1}
+  .verdict-text.approved{color:var(--green)}.verdict-text.review{color:var(--amber)}.verdict-text.blocked{color:var(--red)}
+  .verdict-sub{font-size:12px;color:var(--muted);margin-top:3px}
+  .score-ring{width:72px;height:72px;border-radius:50%;display:flex;flex-direction:column;align-items:center;justify-content:center;border:4px solid;font-family:'Baloo 2',cursive;font-weight:800;font-size:18px;line-height:1}
+  .score-ring.approved{border-color:var(--green);color:var(--green);background:rgba(19,136,8,.08)}
+  .score-ring.review{border-color:var(--amber);color:var(--amber);background:rgba(245,124,0,.08)}
+  .score-ring.blocked{border-color:var(--red);color:var(--red);background:rgba(211,47,47,.08)}
+  .score-ring-lbl{font-size:9px;font-weight:500;opacity:.7;letter-spacing:.5px}
+  .bar-wrap{display:flex;flex-direction:column;gap:5px}
+  .bar-labels{display:flex;justify-content:space-between;font-size:10px;color:var(--muted)}
+  .bar-track{height:8px;background:var(--border);border-radius:4px;overflow:hidden}
+  .bar-fill{height:100%;border-radius:4px;transition:width .7s cubic-bezier(.4,0,.2,1)}
+  .bar-fill.approved{background:linear-gradient(90deg,var(--green),#66BB6A)}
+  .bar-fill.review{background:linear-gradient(90deg,var(--amber),#FFB300)}
+  .bar-fill.blocked{background:linear-gradient(90deg,var(--red),#FF5252)}
+  .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .info-cell{background:var(--cream);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+  .info-lbl{font-size:10px;color:var(--muted);font-weight:600;letter-spacing:.5px;text-transform:uppercase}
+  .info-val{font-size:14px;font-weight:600;color:var(--text);margin-top:3px}
+  .risk-tags{display:flex;flex-wrap:wrap;gap:6px}
+  .risk-tag{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;background:rgba(255,107,0,.08);border:1px solid rgba(255,107,0,.2);color:var(--saffron)}
+  .ai-box{background:linear-gradient(135deg,#EEF2FF,#F0FFF4);border:1px solid #C5CAE9;border-radius:10px;padding:14px 16px}
+  .ai-lbl{font-size:10px;font-weight:700;letter-spacing:1.5px;text-transform:uppercase;color:var(--navy2);margin-bottom:8px;display:flex;align-items:center;gap:6px}
+  .ai-text{font-size:13px;line-height:1.75;color:var(--text);white-space:pre-line}
+  .dots{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding:20px}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--saffron2);animation:djump 1.2s ease-in-out infinite}
+  .dot:nth-child(2){animation-delay:.2s}.dot:nth-child(3){animation-delay:.4s}
+  @keyframes djump{0%,60%,100%{transform:translateY(0)}30%{transform:translateY(-5px)}}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  thead tr{background:linear-gradient(135deg,var(--navy2),#2a2a8e)}
+  th{padding:11px 14px;text-align:left;font-size:10px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:rgba(255,255,255,.8)}
+  td{padding:11px 14px;border-bottom:1px solid var(--border)}
+  tr:last-child td{border-bottom:none}
+  tbody tr:hover td{background:var(--cream)}
+  tbody tr.new td{animation:rowin .4s ease}
+  @keyframes rowin{from{background:rgba(255,153,51,.15)}to{background:transparent}}
+  .badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700}
+  .badge.approved{background:#E8F5E9;color:var(--green);border:1px solid rgba(19,136,8,.2)}
+  .badge.review{background:#FFF3E0;color:var(--amber);border:1px solid rgba(245,124,0,.2)}
+  .badge.blocked{background:#FFEBEE;color:var(--red);border:1px solid rgba(211,47,47,.2)}
+  .sc.approved{color:var(--green);font-weight:600}.sc.review{color:var(--amber);font-weight:600}.sc.blocked{color:var(--red);font-weight:600}
+  .empty-log{padding:32px;text-align:center;color:var(--muted);font-size:13px}
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9000;display:flex;align-items:center;justify-content:center;animation:fadein .3s ease}
+  @keyframes fadein{from{opacity:0}to{opacity:1}}
+  .alert-box{background:#fff;border-radius:20px;width:420px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.3);animation:popin .4s cubic-bezier(.34,1.56,.64,1)}
+  @keyframes popin{from{transform:scale(.7);opacity:0}to{transform:scale(1);opacity:1}}
+  .alert-hdr{padding:28px 24px;text-align:center}
+  .alert-hdr.red{background:linear-gradient(135deg,#D32F2F,#FF5252)}
+  .alert-hdr.orange{background:linear-gradient(135deg,#E65100,#FF9800)}
+  .alert-siren{font-size:50px;animation:siren .5s ease-in-out infinite alternate}
+  @keyframes siren{from{transform:scale(1)}to{transform:scale(1.15)}}
+  .alert-title{font-family:'Baloo 2',cursive;font-size:24px;font-weight:800;color:#fff;margin-top:8px}
+  .alert-sub{font-size:12px;color:rgba(255,255,255,.8);margin-top:4px}
+  .alert-body{padding:24px}
+  .alert-score{font-family:'Baloo 2',cursive;font-size:32px;font-weight:800;text-align:center;margin:8px 0 2px}
+  .alert-score.red{color:var(--red)}.alert-score.orange{color:var(--amber)}
+  .alert-score-lbl{font-size:10px;color:var(--muted);text-align:center;letter-spacing:1px;text-transform:uppercase;margin-bottom:16px}
+  .alert-row{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #f0f0f0;font-size:13px}
+  .alert-row:last-of-type{border-bottom:none}
+  .alert-lbl{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+  .alert-val{font-weight:700;color:var(--text)}
+  .alert-btn{width:100%;padding:13px;color:#fff;border:none;border-radius:10px;font-family:'Baloo 2',cursive;font-size:15px;font-weight:700;cursor:pointer;margin-top:16px;transition:all .2s}
+  .alert-btn.red{background:linear-gradient(135deg,var(--red),#FF5252)}
+  .alert-btn.orange{background:linear-gradient(135deg,#E65100,#FF9800)}
+  .alert-btn2{width:100%;padding:10px;background:transparent;color:var(--muted);border:1.5px solid #ddd;border-radius:10px;font-family:'DM Sans',sans-serif;font-size:13px;cursor:pointer;margin-top:8px}
+  .fab{position:fixed;bottom:28px;right:28px;width:58px;height:58px;background:linear-gradient(135deg,var(--saffron),var(--saffron2));border-radius:50%;border:none;cursor:pointer;box-shadow:0 4px 20px rgba(255,107,0,.4);display:flex;align-items:center;justify-content:center;font-size:26px;z-index:8000;transition:all .2s}
+  .fab:hover{transform:scale(1.1)}
+  .fab-badge{position:absolute;top:-2px;right:-2px;width:18px;height:18px;background:var(--green);border-radius:50%;font-size:10px;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;border:2px solid #fff}
+  .chat-win{position:fixed;bottom:98px;right:28px;width:360px;height:490px;background:#fff;border-radius:20px;box-shadow:0 8px 40px rgba(0,0,128,.2);z-index:8000;display:none;flex-direction:column;overflow:hidden}
+  .chat-win.open{display:flex;animation:chatpop .3s cubic-bezier(.34,1.56,.64,1)}
+  @keyframes chatpop{from{transform:scale(.8) translateY(20px);opacity:0}to{transform:scale(1) translateY(0);opacity:1}}
+  .chat-head{background:var(--navy2);padding:16px 18px;display:flex;align-items:center;gap:10px}
+  .chat-avatar{width:36px;height:36px;background:var(--saffron2);border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0}
+  .chat-name{font-family:'Baloo 2',cursive;font-size:15px;font-weight:700;color:#fff}
+  .chat-status-txt{font-size:11px;color:rgba(255,255,255,.55)}
+  .chat-close{margin-left:auto;background:transparent;border:none;color:rgba(255,255,255,.6);font-size:20px;cursor:pointer}
+  .chat-msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px;background:#F8F9FA}
+  .msg{max-width:82%;padding:10px 14px;border-radius:14px;font-size:13px;line-height:1.55}
+  .msg.bot{background:#fff;color:var(--text);border-bottom-left-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.08);align-self:flex-start}
+  .msg.user{background:var(--navy2);color:#fff;border-bottom-right-radius:4px;align-self:flex-end}
+  .msg.typing{background:#fff;color:var(--muted);font-style:italic;align-self:flex-start;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+  .chat-chips{display:flex;flex-wrap:wrap;gap:6px;padding:0 14px 10px;background:#fff}
+  .chip{padding:5px 12px;background:var(--cream);border:1px solid var(--border);border-radius:20px;font-size:11px;cursor:pointer;color:var(--navy2);font-weight:500;transition:all .15s}
+  .chip:hover{background:rgba(255,107,0,.1);border-color:var(--saffron)}
+  .chat-input-row{padding:12px 14px;border-top:1px solid var(--border);display:flex;gap:8px;background:#fff}
+  .chat-input{flex:1;padding:9px 14px;border:1.5px solid var(--border);border-radius:24px;font-family:'DM Sans',sans-serif;font-size:13px;outline:none;background:var(--cream)}
+  .chat-input:focus{border-color:var(--saffron2)}
+  .chat-send{padding:9px 18px;background:var(--saffron);color:#fff;border:none;border-radius:24px;font-weight:600;cursor:pointer;font-size:13px;transition:background .15s}
+  .chat-send:hover{background:var(--saffron2)}
+  footer{background:var(--navy2);padding:16px 32px;margin-top:12px;text-align:center}
+  footer p{font-size:12px;color:rgba(255,255,255,.4)}
+  footer span{color:var(--saffron2)}
+  ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:#C5B8A8;border-radius:3px}
+</style>
+</head>
+<body>
+<div class="tricolor"></div>
+<header>
+  <div class="header-inner">
+    <div class="logo-area">
+      <div class="logo-icon">🛡️</div>
+      <div>
+        <div class="logo-main">Suraksha<span>Pay</span></div>
+        <div class="logo-sub">AI-Powered Fraud Detection System</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="live-pill"><div class="live-dot"></div> Live Monitor</div>
+      <div class="hdr-info"><div><strong id="hdr-time">00:00:00</strong></div><div>Random Forest + Groq AI</div></div>
+    </div>
+  </div>
+</header>
+<div class="stats-bar">
+  <div class="stats-inner">
+    <div class="stat-item"><span style="font-size:20px">📊</span><div><div class="stat-num" id="s-total">0</div><div class="stat-lbl">Total Analysed</div></div></div>
+    <div class="stat-item"><span style="font-size:20px">✅</span><div><div class="stat-num" id="s-approved">0</div><div class="stat-lbl">Authorised</div></div></div>
+    <div class="stat-item"><span style="font-size:20px">⚠️</span><div><div class="stat-num" id="s-review">0</div><div class="stat-lbl">Under Review</div></div></div>
+    <div class="stat-item"><span style="font-size:20px">🚫</span><div><div class="stat-num" id="s-blocked">0</div><div class="stat-lbl">Blocked</div></div></div>
+  </div>
+</div>
+<div class="main">
+  <div>
+    <div class="card">
+      <div class="card-head">
+        <div class="card-icon navy">🔗</div>
+        <div><div class="card-title">Backend Connection</div><div class="card-sub">Paste ngrok URL from Colab Cell 6</div></div>
+      </div>
+      <div class="card-body">
+        <div class="field"><label>ngrok URL</label><input type="text" id="api-url" placeholder="https://xxxx.ngrok-free.app"></div>
+        <p style="font-size:11px;color:var(--muted)">🔑 Run Cell 6 in Colab → copy the printed URL → paste above</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <div class="card-icon saffron">💳</div>
+        <div><div class="card-title">Transaction Details</div><div class="card-sub">Enter payment information</div></div>
+      </div>
+      <div class="card-body">
+        <div class="section-label">Quick Fill — Test Scenarios</div>
+        <div class="preset-grid">
+          <button class="preset p1" onclick="fill('normal')">🛒 Normal Purchase</button>
+          <button class="preset p2" onclick="fill('online')">📱 UPI / Online</button>
+          <button class="preset p3" onclick="fill('suspicious')">⚠️ Suspicious</button>
+          <button class="preset p4" onclick="fill('fraud')">🚨 High Risk</button>
+        </div>
+        <div class="section-label">Payment Info</div>
+        <div class="field"><label>Merchant Name</label><input type="text" id="merchant_name" value="Big Bazaar"></div>
+        <div class="field"><label>Amount (₹ INR)</label><div class="rupee-wrap"><span class="rs">₹</span><input type="number" id="amount" value="850" min="0" step="0.01"></div></div>
+        <div class="field-row">
+          <div class="field"><label>Transaction Type</label><select id="is_online"><option value="0">In-Store / POS</option><option value="1">Online / UPI</option></select></div>
+          <div class="field"><label>Card Age (days)</label><input type="number" id="card_age_days" value="365" min="1"></div>
+        </div>
+        <div class="section-label">Time & Location</div>
+        <div class="field-row">
+          <div class="field"><label>Hour (0–23)</label><input type="number" id="hour" value="14" min="0" max="23"></div>
+          <div class="field"><label>Day of Week</label><select id="day_of_week"><option value="0">Monday</option><option value="1">Tuesday</option><option value="2">Wednesday</option><option value="3">Thursday</option><option value="4" selected>Friday</option><option value="5">Saturday</option><option value="6">Sunday</option></select></div>
+        </div>
+        <div class="field"><label>Distance from Registered Address (km)</label><input type="number" id="geo_distance_km" value="10" min="0"></div>
+        <div class="section-label">Risk Signals</div>
+        <div class="field-row">
+          <div class="field"><label>Merchant Risk Score (0–1)</label><input type="number" id="merchant_risk" value="0.1" min="0" max="1" step="0.01"></div>
+          <div class="field"><label>Transactions This Hour</label><input type="number" id="txn_per_hour" value="2" min="0"></div>
+        </div>
+        <button class="btn-analyze" id="analyze-btn" onclick="analyze()">⚡ Analyse Transaction</button>
+        <button class="btn-auto" id="auto-btn" onclick="toggleAuto()">▶ Start Auto Simulation</button>
+      </div>
+    </div>
+  </div>
+  <div class="right-col">
+    <div class="card">
+      <div class="card-head">
+        <div class="card-icon green">🛡️</div>
+        <div><div class="card-title">Analysis Result</div><div class="card-sub" id="res-sub">Waiting for transaction...</div></div>
+      </div>
+      <div id="result-area">
+        <div class="result-placeholder">
+          <div class="placeholder-icon">🏦</div>
+          <div style="color:var(--muted);font-size:13px">Submit a transaction to see the fraud analysis</div>
+          <div style="color:var(--muted);font-size:11px;margin-top:4px">Powered by Random Forest + Isolation Forest + Groq LLaMA 3.3</div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head">
+        <div class="card-icon blue">📋</div>
+        <div><div class="card-title">Transaction History</div><div class="card-sub">Recent analysed transactions</div></div>
+        <button onclick="clearHistory()" style="margin-left:auto;padding:5px 12px;background:transparent;border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;color:var(--muted);font-family:'DM Sans',sans-serif">Clear</button>
+      </div>
+      <div id="history-area"><div class="empty-log">No transactions analysed yet</div></div>
+    </div>
+  </div>
+</div>
+<footer><p><span>FRAUDSHIELD</span> — AI Fraud Detection &nbsp;|&nbsp; Python · Flask · Groq AI · scikit-learn &nbsp;|&nbsp; 🇮🇳 Made for India</p></footer>
+
+<!-- FRAUD BLOCKED ALERT -->
+<div class="overlay" id="fraud-overlay" style="display:none">
+  <div class="alert-box">
+    <div class="alert-hdr red"><div class="alert-siren">🚨</div><div class="alert-title">Fraudulent Activity Detected!</div><div class="alert-sub">Transaction has been automatically blocked</div></div>
+    <div class="alert-body">
+      <div class="alert-score red" id="al-score">--</div>
+      <div class="alert-score-lbl">Fraud Probability Score</div>
+      <div class="alert-row"><span class="alert-lbl">Merchant</span><span class="alert-val" id="al-merchant">--</span></div>
+      <div class="alert-row"><span class="alert-lbl">Amount</span><span class="alert-val" id="al-amount">--</span></div>
+      <div class="alert-row"><span class="alert-lbl">Time</span><span class="alert-val" id="al-time">--</span></div>
+      <div class="alert-row"><span class="alert-lbl">Status</span><span class="alert-val" style="color:var(--red)">🚫 Transaction Blocked</span></div>
+      <button class="alert-btn red" onclick="closeOverlay('fraud-overlay')">✅ Acknowledge & Block Transaction</button>
+      <button class="alert-btn2" onclick="closeOverlay('fraud-overlay')">Escalate to Senior Analyst</button>
+    </div>
+  </div>
+</div>
+
+<!-- REVIEW ALERT -->
+<div class="overlay" id="review-overlay" style="display:none">
+  <div class="alert-box">
+    <div class="alert-hdr orange"><div class="alert-siren">⚠️</div><div class="alert-title">Review Required</div><div class="alert-sub">Suspicious behaviour detected — manual review needed</div></div>
+    <div class="alert-body">
+      <div class="alert-score orange" id="rv-score">--</div>
+      <div class="alert-score-lbl">Fraud Probability Score</div>
+      <div class="alert-row"><span class="alert-lbl">Merchant</span><span class="alert-val" id="rv-merchant">--</span></div>
+      <div class="alert-row"><span class="alert-lbl">Amount</span><span class="alert-val" id="rv-amount">--</span></div>
+      <div class="alert-row"><span class="alert-lbl">Time</span><span class="alert-val" id="rv-time">--</span></div>
+      <div class="alert-row"><span class="alert-lbl">Status</span><span class="alert-val" style="color:var(--amber)">⚠️ Under Review</span></div>
+      <button class="alert-btn orange" onclick="closeOverlay('review-overlay')">👁️ Send to Review Queue</button>
+      <button class="alert-btn2" onclick="closeOverlay('review-overlay')">Authorise Anyway</button>
+    </div>
+  </div>
+</div>
+
+<!-- CHATBOT -->
+<button class="fab" onclick="toggleChat()" title="Ask SurakshaPay AI">🤖<div class="fab-badge">AI</div></button>
+<div class="chat-win" id="chat-win">
+  <div class="chat-head">
+    <div class="chat-avatar">🛡️</div>
+    <div><div class="chat-name">SurakshaPay AI Assistant</div><div class="chat-status-txt">● Online — Ask me about fraud detection</div></div>
+    <button class="chat-close" onclick="toggleChat()">✕</button>
+  </div>
+  <div class="chat-msgs" id="chat-msgs">
+    <div class="msg bot">👋 Hello! I am the SurakshaPay AI assistant. I can help you understand fraud scores, explain risk signals, and answer questions about transactions. How can I help you today?</div>
+  </div>
+  <div class="chat-chips" id="chat-chips">
+    <div class="chip" onclick="quickAsk(this)">What is a fraud score?</div>
+    <div class="chip" onclick="quickAsk(this)">How does the ML model work?</div>
+    <div class="chip" onclick="quickAsk(this)">Common UPI fraud patterns</div>
+    <div class="chip" onclick="quickAsk(this)">What is merchant risk?</div>
+  </div>
+  <div class="chat-input-row">
+    <input class="chat-input" id="chat-input" placeholder="Ask about fraud detection..." onkeydown="if(event.key==='Enter')sendChat()">
+    <button class="chat-send" onclick="sendChat()">Send</button>
+  </div>
+</div>
+
+<script>
+function tick(){document.getElementById('hdr-time').textContent=new Date().toTimeString().slice(0,8);}
+tick();setInterval(tick,1000);
+window.addEventListener('DOMContentLoaded',()=>{
+  const o=window.location.origin;
+  if(o&&!o.includes('null')&&!o.includes('file'))document.getElementById('api-url').value=o;
+});
+const PRESETS={
+  normal:    {amount:850,   hour:14,day_of_week:4,merchant_risk:0.08,geo_distance_km:4,   txn_per_hour:1, card_age_days:730,is_online:0,merchant_name:'Big Bazaar'},
+  online:    {amount:14999, hour:20,day_of_week:5,merchant_risk:0.18,geo_distance_km:0,   txn_per_hour:2, card_age_days:365,is_online:1,merchant_name:'Flipkart'},
+  suspicious:{amount:48000, hour:2, day_of_week:6,merchant_risk:0.55,geo_distance_km:480, txn_per_hour:7, card_age_days:18, is_online:1,merchant_name:'Unknown Seller'},
+  fraud:     {amount:850000,hour:3, day_of_week:0,merchant_risk:0.93,geo_distance_km:2200,txn_per_hour:15,card_age_days:3,  is_online:1,merchant_name:'Offshore Store'},
+};
+function fill(key){Object.entries(PRESETS[key]).forEach(([k,v])=>{const el=document.getElementById(k);if(el)el.value=v;});}
+function getData(){
+  return{
+    amount:         parseFloat(document.getElementById('amount').value)||100,
+    hour:           parseInt(document.getElementById('hour').value)||12,
+    day_of_week:    parseInt(document.getElementById('day_of_week').value),
+    merchant_risk:  parseFloat(document.getElementById('merchant_risk').value)||0.1,
+    geo_distance_km:parseFloat(document.getElementById('geo_distance_km').value)||10,
+    txn_per_hour:   parseInt(document.getElementById('txn_per_hour').value)||1,
+    card_age_days:  parseInt(document.getElementById('card_age_days').value)||365,
+    is_online:      parseInt(document.getElementById('is_online').value),
+    merchant_name:  document.getElementById('merchant_name').value||'Unknown',
+  };
+}
+let history=[],autoTimer=null,autoOn=false,busy=false;
+async function analyze(){
+  if(busy)return;
+  const base=document.getElementById('api-url').value.trim().replace(/\/$/,'');
+  if(!base){alert('Please paste your ngrok URL first.');return;}
+  busy=true;
+  const btn=document.getElementById('analyze-btn');
+  btn.disabled=true;btn.textContent='⏳ Analysing...';btn.classList.add('loading');
+  document.getElementById('res-sub').textContent='Analysing...';
+  document.getElementById('result-area').innerHTML='<div class="dots"><div class="dot"></div><div class="dot"></div><div class="dot"></div>Running ML model and Groq AI analysis...</div>';
+  try{
+    const res=await fetch(base+'/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(getData())});
+    const d=await res.json();
+    if(!d.success)throw new Error(d.error);
+    renderResult(d);addHistory(d);updateStats();showAlert(d);
+  }catch(e){
+    alert('Error: '+e.message);
+    document.getElementById('result-area').innerHTML='<div class="result-placeholder"><div style="font-size:36px">⚠️</div><div style="color:var(--red);font-size:13px">'+e.message+'</div></div>';
+  }finally{
+    busy=false;btn.disabled=false;btn.textContent='⚡ Analyse Transaction';btn.classList.remove('loading');
+  }
+}
+function renderResult(d){
+  const cls={high:'blocked',medium:'review',low:'approved'}[d.risk];
+  const emj={high:'🚫',medium:'⚠️',low:'✅'}[d.risk];
+  const lbl={high:'BLOCKED',medium:'REVIEW',low:'AUTHORISED'}[d.risk];
+  const amt=parseFloat(d.amount).toLocaleString('en-IN',{minimumFractionDigits:2});
+  const feats=Object.entries(d.top_features||{}).map(([k,v])=>'<div class="risk-tag">'+k.replace(/_/g,' ')+' · '+v+'</div>').join('');
+  document.getElementById('res-sub').textContent='Txn #'+d.id+' · '+d.merchant+' · '+d.timestamp;
+  document.getElementById('result-area').innerHTML=`
+    <div class="result-body">
+      <div class="verdict-row">
+        <div class="verdict-left">
+          <div class="verdict-emoji">${emj}</div>
+          <div><div class="verdict-text ${cls}">${lbl}</div><div class="verdict-sub">₹${amt} at ${d.merchant}</div></div>
+        </div>
+        <div class="score-ring ${cls}"><span>${(d.score*100).toFixed(0)}</span><span class="score-ring-lbl">SCORE</span></div>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar-labels"><span>Fraud Probability</span><span>${(d.score*100).toFixed(1)}%</span></div>
+        <div class="bar-track"><div class="bar-fill ${cls}" style="width:${(d.score*100).toFixed(1)}%"></div></div>
+        <div class="bar-labels"><span>0% Safe</span><span>40% Review</span><span>70% Block</span></div>
+      </div>
+      <div class="info-grid">
+        <div class="info-cell"><div class="info-lbl">Amount</div><div class="info-val">₹${amt}</div></div>
+        <div class="info-cell"><div class="info-lbl">Merchant</div><div class="info-val">${d.merchant}</div></div>
+        <div class="info-cell"><div class="info-lbl">Fraud Score</div><div class="info-val">${(d.score*100).toFixed(2)}%</div></div>
+        <div class="info-cell"><div class="info-lbl">Decision</div><div class="info-val">${lbl}</div></div>
+      </div>
+      <div><div class="section-label" style="margin-bottom:8px">Top Risk Factors</div><div class="risk-tags">${feats}</div></div>
+      <div class="ai-box"><div class="ai-lbl">🤖 Groq AI Analysis</div><div class="ai-text">${(d.explanation||'').trim()}</div></div>
+    </div>`;
+}
+function showAlert(d){
+  const amt='₹'+parseFloat(d.amount).toLocaleString('en-IN',{minimumFractionDigits:2});
+  if(d.risk==='high'){
+    document.getElementById('al-score').textContent=(d.score*100).toFixed(1)+'%';
+    document.getElementById('al-merchant').textContent=d.merchant;
+    document.getElementById('al-amount').textContent=amt;
+    document.getElementById('al-time').textContent=d.timestamp;
+    document.getElementById('fraud-overlay').style.display='flex';
+  }else if(d.risk==='medium'){
+    document.getElementById('rv-score').textContent=(d.score*100).toFixed(1)+'%';
+    document.getElementById('rv-merchant').textContent=d.merchant;
+    document.getElementById('rv-amount').textContent=amt;
+    document.getElementById('rv-time').textContent=d.timestamp;
+    document.getElementById('review-overlay').style.display='flex';
+  }
+}
+function closeOverlay(id){document.getElementById(id).style.display='none';}
+document.addEventListener('click',e=>{
+  ['fraud-overlay','review-overlay'].forEach(id=>{const el=document.getElementById(id);if(e.target===el)el.style.display='none';});
+});
+function addHistory(d){
+  history.unshift(d);
+  const area=document.getElementById('history-area');
+  const cls={high:'blocked',medium:'review',low:'approved'}[d.risk];
+  const lbl={high:'BLOCKED',medium:'REVIEW',low:'AUTHORISED'}[d.risk];
+  const emj={high:'🚫',medium:'⚠️',low:'✅'}[d.risk];
+  const amt=parseFloat(d.amount).toLocaleString('en-IN',{minimumFractionDigits:2});
+  if(!document.getElementById('hist-tbl')){
+    area.innerHTML='<table id="hist-tbl"><thead><tr><th>#</th><th>Time</th><th>Merchant</th><th>Amount (₹)</th><th>Score</th><th>Decision</th></tr></thead><tbody id="hist-body"></tbody></table>';
+  }
+  const tr=document.createElement('tr');tr.className='new';
+  tr.innerHTML='<td style="color:var(--muted)">'+d.id+'</td><td style="color:var(--muted)">'+d.timestamp+'</td><td><strong>'+d.merchant+'</strong></td><td>₹'+amt+'</td><td><span class="sc '+cls+'">'+(d.score*100).toFixed(1)+'%</span></td><td><span class="badge '+cls+'">'+emj+' '+lbl+'</span></td>';
+  document.getElementById('hist-body').insertBefore(tr,document.getElementById('hist-body').firstChild);
+}
+function clearHistory(){history=[];document.getElementById('history-area').innerHTML='<div class="empty-log">No transactions analysed yet</div>';updateStats();}
+function updateStats(){
+  document.getElementById('s-total').textContent=history.length;
+  document.getElementById('s-approved').textContent=history.filter(t=>t.risk==='low').length;
+  document.getElementById('s-review').textContent=history.filter(t=>t.risk==='medium').length;
+  document.getElementById('s-blocked').textContent=history.filter(t=>t.risk==='high').length;
+}
+const AUTO=['normal','normal','online','suspicious','fraud'];
+function toggleAuto(){
+  const btn=document.getElementById('auto-btn');
+  if(autoOn){clearInterval(autoTimer);autoOn=false;btn.textContent='▶ Start Auto Simulation';btn.classList.remove('running');}
+  else{autoOn=true;btn.textContent='⏹ Stop Simulation';btn.classList.add('running');autoTimer=setInterval(()=>{fill(AUTO[Math.floor(Math.random()*AUTO.length)]);analyze();},2500);}
+}
+let chatOpen=false;
+function toggleChat(){chatOpen=!chatOpen;document.getElementById('chat-win').classList.toggle('open',chatOpen);}
+function getStats(){
+  return{total:history.length,blocked:history.filter(t=>t.risk==='high').length,review:history.filter(t=>t.risk==='medium').length,approved:history.filter(t=>t.risk==='low').length,lastTxn:history[0]?'₹'+parseFloat(history[0].amount).toLocaleString('en-IN')+' at '+history[0].merchant:'None yet'};
+}
+async function sendChat(){
+  const input=document.getElementById('chat-input');
+  const msg=input.value.trim();if(!msg)return;
+  const base=document.getElementById('api-url').value.trim().replace(/[/]/$/,'');
+  if(!base){alert('Set ngrok URL first.');return;}
+  input.value='';
+  document.getElementById('chat-chips').style.display='none';
+  appendMsg(msg,'user');appendMsg('Thinking...','typing','typing-msg');
+  try{
+    const res=await fetch(base+'/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg,context:getStats()})});
+    const data=await res.json();
+    document.getElementById('typing-msg')?.remove();
+    appendMsg(data.reply||'Sorry, could not get a response.','bot');
+  }catch(e){document.getElementById('typing-msg')?.remove();appendMsg('Connection error. Check ngrok URL.','bot');}
+}
+function quickAsk(el){document.getElementById('chat-input').value=el.textContent;sendChat();}
+function appendMsg(text,role,id){
+  const div=document.createElement('div');div.className='msg '+role;div.textContent=text;
+  if(id)div.id=id;
+  const msgs=document.getElementById('chat-msgs');msgs.appendChild(div);msgs.scrollTop=msgs.scrollHeight;
+}
+</script>
+</body>
+</html>"""
+
+os.makedirs("/content/templates", exist_ok=True)
+with open("/content/templates/index.html", "w") as f:
+    f.write(HTML_CONTENT)
+print("✅ HTML dashboard written directly from code — no external file needed")
+
+# ── Flask app ─────────────────────────────────────────────────────
+app = Flask(__name__, template_folder="/content/templates")
+CORS(app)
+
+@app.route("/")
+def index():
+    return send_from_directory("/content/templates", "index.html")
+
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    data = request.json
+    try:
+        X_new   = engineer_features(data)
+        X_new_s = scaler.transform(X_new)
+        rf_p    = float(rf.predict_proba(X_new_s)[0][1])
+        iso_s   = float(-iso.score_samples(X_new_s)[0])
+        iso_n   = max(0.0, min(1.0, (iso_s - 0.3) / 0.4))
+        score   = round(0.7 * rf_p + 0.3 * iso_n, 4)
+        decision = "BLOCKED" if score > 0.7 else ("REVIEW" if score > 0.4 else "APPROVED")
+        risk     = "high"    if score > 0.7 else ("medium" if score > 0.4 else "low")
+        top_feat = get_top_features(X_new_s)
+        expl = explain(data, score, top_feat) if score > 0.25 else \
+               "* Transaction looks legitimate with no major anomalies.\n* All indicators within normal limits.\n* No action required — authorise the transaction."
+        record = {
+            "id": len(transaction_log)+1, "timestamp": time.strftime("%H:%M:%S"),
+            "amount": data.get("amount", 0), "merchant": data.get("merchant_name", "Unknown"),
+            "score": score, "decision": decision, "risk": risk,
+            "top_features": top_feat, "explanation": expl, "success": True,
+        }
+        transaction_log.append(record)
+        return jsonify(record)
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    data    = request.json
+    msg     = data.get("message", "")
+    context = data.get("context", {})
+    prompt  = f"""You are FRAUDSHIELD AI, a helpful fraud detection assistant for an Indian payment platform.
+Keep answers to 2-3 sentences. Use Rs. for amounts. Be clear and practical. Use British English (analyse, authorise, behaviour).
+System stats: {json.dumps(context)}
+User question: {msg}"""
+    try:
+        r = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=180, temperature=0.4,
+        )
+        return jsonify({"reply": r.choices[0].message.content.strip()})
+    except Exception as e:
+        return jsonify({"reply": f"Error: {str(e)}"}), 500
+
+@app.route("/stats")
+def stats():
+    if not transaction_log:
+        return jsonify({"total":0,"blocked":0,"review":0,"approved":0})
+    total   = len(transaction_log)
+    blocked = sum(1 for t in transaction_log if t["decision"]=="BLOCKED")
+    review  = sum(1 for t in transaction_log if t["decision"]=="REVIEW")
+    return jsonify({"total":total,"blocked":blocked,"review":review,"approved":total-blocked-review})
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+
+ngrok.set_auth_token(NGROK_TOKEN)
+public_url = ngrok.connect(PORT).public_url
+
+print("\n" + "━"*52)
+print("  🚀  FRAUDSHIELD IS LIVE")
+print(f"  🌐  {public_url}")
+print("  📋  Open this URL in your browser")
+print("  ⚠️   Keep this cell running!")
+print("━"*52 + "\n")
+
+t = threading.Thread(target=run_flask, daemon=True)
+t.start()
+time.sleep(2)
+print("✅ Server running. Dashboard live at URL above.")
+
+
+# ── KILL ALL OLD NGROK TUNNELS BEFORE STARTING NEW ONE ──
+from pyngrok import ngrok
+
+# Kill every open tunnel
+for tunnel in ngrok.get_tunnels():
+    print(f"Closing tunnel: {tunnel.public_url}")
+    ngrok.disconnect(tunnel.public_url)
+
+# Also fully kill the ngrok process
+ngrok.kill()
+print("✅ All old tunnels closed. Now run Cell 6 again.")
