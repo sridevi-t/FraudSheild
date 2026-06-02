@@ -115,7 +115,7 @@ plt.tight_layout(); plt.show()
 print("✅ Charts displayed")
 
 # ================================================================
-#  CELL 6 — FRAUDSHIELD WEB APP (FULLY SELF-CONTAINED)
+#  CELL 6 — SURAKSHAPAY WEB APP (FULLY SELF-CONTAINED)
 #  1. Replace GROQ_API_KEY  → your key from console.groq.com
 #  2. Replace NGROK_TOKEN   → your token from dashboard.ngrok.com
 #  3. Run Cells 1–5 first, then run this cell
@@ -130,8 +130,8 @@ from groq import Groq
 from pyngrok import ngrok
 
 # ── PASTE YOUR KEYS HERE ─────────────────────────────────────────
-GROQ_API_KEY = "gsk_YOUR_GROQ_API_KEY_HERE"   # from console.groq.com
-NGROK_TOKEN  = "YOUR_NGROK_AUTH_TOKEN_HERE"   # from dashboard.ngrok.com
+GROQ_API_KEY = "PASTE_API_KEY"   # from console.groq.com
+NGROK_TOKEN  = "YOUR_AUTH_TOKEN"   # from dashboard.ngrok.com
 PORT         = 5050
 # ─────────────────────────────────────────────────────────────────
 
@@ -181,12 +181,12 @@ HTML_CONTENT = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SurakshaPay — AI Fraud Detection</title>
+<title>FinShield AI — AI Fraud Detection</title>
 <link href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@400;600;700;800&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --saffron:#FF6B00; --saffron2:#FF9933; --green:#138808; --navy2:#1a1a6e;
-    --white:#FFFFFF; --cream:#FFF8F0; --red:#D32F2F; --amber:#F57C00;
+    --saffron:#993399; --saffron2:#FF9933; --green:#138808; --navy2:#1a1a6e;
+    --white:#FFFFFF; --cream:#FFF8F0; --red:#D32F2F; --amber:#F57C00; 
     --bg:#F5F0E8; --card:#FFFFFF; --border:#E8DDD0; --text:#1A1A2E;
     --muted:#7A6E62; --blue:#0066CC;
   }
@@ -356,7 +356,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="logo-area">
       <div class="logo-icon">🛡️</div>
       <div>
-        <div class="logo-main">Suraksha<span>Pay</span></div>
+        <div class="logo-main">FinShield AI<span></span></div>
         <div class="logo-sub">AI-Powered Fraud Detection System</div>
       </div>
     </div>
@@ -379,11 +379,11 @@ HTML_CONTENT = """<!DOCTYPE html>
     <div class="card">
       <div class="card-head">
         <div class="card-icon navy">🔗</div>
-        <div><div class="card-title">Backend Connection</div><div class="card-sub">Paste ngrok URL from Colab Cell 6</div></div>
+        <div><div class="card-title">Backend Connection</div><div class="card-sub">Paste ngrok URL</div></div>
       </div>
       <div class="card-body">
         <div class="field"><label>ngrok URL</label><input type="text" id="api-url" placeholder="https://xxxx.ngrok-free.app"></div>
-        <p style="font-size:11px;color:var(--muted)">🔑 Run Cell 6 in Colab → copy the printed URL → paste above</p>
+        <p style="font-size:11px;color:var(--muted)">🔑 Colab → copy the printed URL → paste above</p>
       </div>
     </div>
     <div class="card">
@@ -446,7 +446,7 @@ HTML_CONTENT = """<!DOCTYPE html>
     </div>
   </div>
 </div>
-<footer><p><span>FRAUDSHIELD</span> — AI Fraud Detection &nbsp;|&nbsp; Python · Flask · Groq AI · scikit-learn &nbsp;|&nbsp; 🇮🇳 Made for India</p></footer>
+<footer><p><span>🥈 FinShield AI – Intelligent Transaction Monitoring</span> — AI Fraud Detection &nbsp;|&nbsp; Python · Flask · Groq AI · scikit-learn &nbsp;|&nbsp;</p></footer>
 
 <!-- FRAUD BLOCKED ALERT -->
 <div class="overlay" id="fraud-overlay" style="display:none">
@@ -487,11 +487,11 @@ HTML_CONTENT = """<!DOCTYPE html>
 <div class="chat-win" id="chat-win">
   <div class="chat-head">
     <div class="chat-avatar">🛡️</div>
-    <div><div class="chat-name">SurakshaPay AI Assistant</div><div class="chat-status-txt">● Online — Ask me about fraud detection</div></div>
+    <div><div class="chat-name">FinShield AI Assistant</div><div class="chat-status-txt">● Online — Ask me about fraud detection</div></div>
     <button class="chat-close" onclick="toggleChat()">✕</button>
   </div>
   <div class="chat-msgs" id="chat-msgs">
-    <div class="msg bot">👋 Hello! I am the SurakshaPay AI assistant. I can help you understand fraud scores, explain risk signals, and answer questions about transactions. How can I help you today?</div>
+    <div class="msg bot">👋 Hello! I am the FinShield AI assistant. I can help you understand fraud scores, explain risk signals, and answer questions about transactions. How can I help you today?</div>
   </div>
   <div class="chat-chips" id="chat-chips">
     <div class="chip" onclick="quickAsk(this)">What is a fraud score?</div>
@@ -535,7 +535,7 @@ function getData(){
 let history=[],autoTimer=null,autoOn=false,busy=false;
 async function analyze(){
   if(busy)return;
-  const base=document.getElementById('api-url').value.trim().replace(/\/$/,'');
+  const base=document.getElementById('api-url').value.trim().replace(/[/]$/,'');
   if(!base){alert('Please paste your ngrok URL first.');return;}
   busy=true;
   const btn=document.getElementById('analyze-btn');
@@ -640,7 +640,7 @@ function getStats(){
 async function sendChat(){
   const input=document.getElementById('chat-input');
   const msg=input.value.trim();if(!msg)return;
-  const base=document.getElementById('api-url').value.trim().replace(/[/]/$/,'');
+  const base=document.getElementById('api-url').value.trim().replace(/\/$/,'');
   if(!base){alert('Set ngrok URL first.');return;}
   input.value='';
   document.getElementById('chat-chips').style.display='none';
@@ -706,7 +706,7 @@ def chat():
     data    = request.json
     msg     = data.get("message", "")
     context = data.get("context", {})
-    prompt  = f"""You are FRAUDSHIELD AI, a helpful fraud detection assistant for an Indian payment platform.
+    prompt  = f"""You are FinShield AI, a helpful fraud detection assistant for an Indian payment platform.
 Keep answers to 2-3 sentences. Use Rs. for amounts. Be clear and practical. Use British English (analyse, authorise, behaviour).
 System stats: {json.dumps(context)}
 User question: {msg}"""
@@ -736,7 +736,7 @@ ngrok.set_auth_token(NGROK_TOKEN)
 public_url = ngrok.connect(PORT).public_url
 
 print("\n" + "━"*52)
-print("  🚀  FRAUDSHIELD IS LIVE")
+print("  🚀 FinShield AI IS LIVE")
 print(f"  🌐  {public_url}")
 print("  📋  Open this URL in your browser")
 print("  ⚠️   Keep this cell running!")
